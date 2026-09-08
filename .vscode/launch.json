@@ -1,0 +1,94 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "vLLM API server: llama2-13b (debug attention)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "vllm.entrypoints.openai.api_server",
+      "cwd": "${workspaceFolder}/vllm",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "subProcess": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/vllm:${env:PYTHONPATH}",
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+        "RAY_TMPDIR": "${workspaceFolder}/ray_tmp",
+      },
+      "args": [
+        "--host",
+        "localhost",
+        "--port",
+        "8000",
+        "--model",
+        "../model/Llama-2-13b-hf",
+        "--served-model-name",
+        "llama2-13b",
+        "--tensor-parallel-size",
+        "4",
+        "--dtype",
+        "float16",
+        "--max-model-len",
+        "2048",
+        "--enforce-eager",
+        "--disable-log-requests",
+        "--tokenizer",
+        "../model/Llama-2-13b-hf",
+        "--gpu-memory-utilization",
+        "0.90",
+        "--swap-space",
+        "16",
+        "--max-num-seqs",
+        "128",
+        "--disable-log-requests"
+
+
+      ]
+    },
+    {
+      "name": "Benchmark serving: vllm completions",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/vllm/benchmarks/benchmark_serving.py",
+      "cwd": "${workspaceFolder}/vllm",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/vllm:${env:PYTHONPATH}"
+      },
+      "args": [
+        "--backend",
+        "vllm",
+        "--host",
+        "localhost",
+        "--port",
+        "8000",
+        "--endpoint",
+        "/v1/completions",
+        "--model",
+        "llama2-13b",
+        "--tokenizer",
+        "../model/Llama-2-13b-hf",
+        "--dataset-name",
+        "sharegpt",
+        "--dataset-path",
+        "../dataset/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json",
+        "--num-prompts",
+        "8",
+        "--sharegpt-output-len",
+        "512",
+        "--request-rate",
+        "2",
+        "--save-result",
+        "--result-dir",
+        "results",
+        "--metadata",
+        "tp=4",
+        "max_model_len=2048"
+      ]
+    }
+  ]
+}

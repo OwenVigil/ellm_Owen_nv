@@ -1,0 +1,27 @@
+# Large datasets and models
+/data/
+/dataset/
+/model/
+
+# Python environments and caches
+/.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Runtime output
+/ray_tmp/
+/results/
+/vllm/results/
+*.log
+
+# Local configuration
+.env
+.env.*
+
+# Downloaded packages
+*.deb
+
+# Backup of the original nested vllm repository
+/.vllm-git-backup/
