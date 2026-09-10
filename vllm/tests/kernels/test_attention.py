@@ -273,6 +273,128 @@ def test_paged_attention(
     assert torch.allclose(output, ref_output, atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("device", CUDA_DEVICES[:1])
+@torch.inference_mode()
+def test_paged_attention_with_recomputed_prefix(
+    kv_cache_factory,
+    device: str,
+) -> None:
+    torch.random.manual_seed(0)
+    torch.set_default_device(device)
+
+    block_size = 16
+    head_size = 128
+    num_query_heads = 8
+    num_kv_heads = 8
+    num_seqs = 3
+    seq_lens_list = [47, 64, 79]
+    dropped_lens_list = [16, 32, 16]
+    max_seq_len = max(seq_lens_list)
+    max_blocks_per_seq = (
+        max_seq_len + block_size - 1) // block_size
+    num_blocks = num_seqs * max_blocks_per_seq
+    dtype = torch.float16
+    scale = head_size**-0.5
+
+    block_tables = torch.arange(
+        num_blocks, dtype=torch.int).view(num_seqs, max_blocks_per_seq)
+    seq_lens = torch.tensor(seq_lens_list, dtype=torch.int)
+    key_caches, value_caches = kv_cache_factory(
+        num_blocks,
+        block_size,
+        1,
+        num_kv_heads,
+        head_size,
+        "auto",
+        dtype,
+        0,
+        device,
+    )
+    key_cache, value_cache = key_caches[0], value_caches[0]
+    query = torch.randn(num_seqs,
+                        num_query_heads,
+                        head_size,
+                        dtype=dtype)
+
+    expected = torch.empty_like(query)
+    ops.paged_attention_v1(
+        expected,
+        query,
+        key_cache,
+        value_cache,
+        num_kv_heads,
+        scale,
+        block_tables,
+        seq_lens,
+        block_size,
+        max_seq_len,
+        None,
+        "auto",
+        1.0,
+    )
+
+    recomputed_keys = []
+    recomputed_values = []
+    for seq_idx, dropped_len in enumerate(dropped_lens_list):
+        for token_idx in range(dropped_len):
+            block_number = block_tables[
+                seq_idx, token_idx // block_size].item()
+            block_offset = token_idx % block_size
+            recomputed_keys.append(
+                key_cache[block_number, :, :, block_offset, :].reshape(
+                    num_kv_heads, head_size))
+            recomputed_values.append(
+                value_cache[block_number, :, :, block_offset])
+
+    recomputed_key_values = torch.stack(recomputed_keys)
+    recomputed_value_values = torch.stack(recomputed_values)
+    num_recompute_tokens = recomputed_key_values.shape[0]
+    key_storage = torch.empty(
+        num_recompute_tokens,
+        num_kv_heads * head_size + 16,
+        dtype=dtype,
+    )
+    value_storage = torch.empty_like(key_storage)
+    recomputed_key = key_storage[:, :num_kv_heads * head_size].view(
+        num_recompute_tokens, num_kv_heads, head_size)
+    recomputed_value = value_storage[:, :num_kv_heads * head_size].view(
+        num_recompute_tokens, num_kv_heads, head_size)
+    recomputed_key.copy_(recomputed_key_values)
+    recomputed_value.copy_(recomputed_value_values)
+
+    dropped_lens = torch.tensor(dropped_lens_list, dtype=torch.int)
+    recompute_start_locs = torch.zeros(num_seqs + 1, dtype=torch.int)
+    torch.cumsum(dropped_lens,
+                 dim=0,
+                 out=recompute_start_locs[1:])
+    ellm_block_tables = block_tables.clone()
+    for seq_idx, dropped_len in enumerate(dropped_lens_list):
+        ellm_block_tables[seq_idx, :dropped_len // block_size] = -1
+
+    actual = torch.empty_like(query)
+    ops.paged_attention_v1_with_recomputed(
+        actual,
+        query,
+        key_cache,
+        value_cache,
+        recomputed_key,
+        recomputed_value,
+        recompute_start_locs,
+        dropped_lens,
+        num_kv_heads,
+        scale,
+        ellm_block_tables,
+        seq_lens,
+        block_size,
+        max_seq_len,
+        None,
+        "auto",
+        1.0,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-5)
+
+
 def ref_multi_query_kv_attention(
     cu_seq_lens: List[int],
     query: torch.Tensor,

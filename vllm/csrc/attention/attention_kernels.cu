@@ -30,6 +30,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdint>
 
 #ifdef USE_ROCM
   #include <hip/hip_bf16.h>
@@ -110,12 +111,19 @@ __device__ void paged_attention_kernel(
   const int q_stride,
   const int kv_block_stride,
   const int kv_head_stride,
-  const float kv_scale) {
+  const float kv_scale,
+  const scalar_t* __restrict__ recomputed_k,
+  const scalar_t* __restrict__ recomputed_v,
+  const int* __restrict__ recompute_start_locs,
+  const int* __restrict__ dropped_lens,
+  const int recomputed_k_stride,
+  const int recomputed_v_stride) {
   const int seq_idx = blockIdx.y;
   const int partition_idx = blockIdx.z;
   const int max_num_partitions = gridDim.z;
   constexpr bool USE_PARTITIONING = PARTITION_SIZE > 0;
   const int seq_len = seq_lens[seq_idx];
+  const int dropped_len = dropped_lens == nullptr ? 0 : dropped_lens[seq_idx];
   if (USE_PARTITIONING && partition_idx * PARTITION_SIZE >= seq_len) {
     // No work to do. Terminate the thread block.
     return;
@@ -213,31 +221,41 @@ __device__ void paged_attention_kernel(
     for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
       const int physical_block_offset = (thread_group_idx + i * WARP_SIZE) % BLOCK_SIZE;
       const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
+      const bool use_recomputed = token_idx < dropped_len;
       K_vec k_vecs[NUM_VECS_PER_THREAD];
 
 #pragma unroll
       for (int j = 0; j < NUM_VECS_PER_THREAD; j++) {
-        const cache_t* k_ptr = k_cache + physical_block_number * kv_block_stride
-                                       + kv_head_idx * kv_head_stride
-                                       + physical_block_offset * x;
         const int vec_idx = thread_group_offset + j * THREAD_GROUP_SIZE;
-        const int offset1 = (vec_idx * VEC_SIZE) / x;
-        const int offset2 = (vec_idx * VEC_SIZE) % x;
-        if constexpr (IS_FP8_KV_CACHE) {
-#if defined(ENABLE_FP8_E5M2)
-          Quant_vec k_vec_quant = *reinterpret_cast<const Quant_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2);
-          // Vector conversion from Quant_vec to K_vec.
-          k_vecs[j] = fp8_e5m2_unscaled::vec_conversion<K_vec, Quant_vec>(k_vec_quant);
-#elif defined(ENABLE_FP8_E4M3)
-          Quant_vec k_vec_quant = *reinterpret_cast<const Quant_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2);
-          // Vector conversion from Quant_vec to K_vec. Use scaled_vec_conversion to convert FP8_E4M3 quantized k
-          // cache vec to k vec in higher precision (FP16, BFloat16, etc.)
-          k_vecs[j] = fp8_e4m3::scaled_vec_conversion<K_vec, Quant_vec>(k_vec_quant, kv_scale);
-#else
-          assert(false);
-#endif
+        if (use_recomputed) {
+          const int recomputed_token_idx = recompute_start_locs[seq_idx]
+                                           + token_idx;
+          const scalar_t* k_ptr = recomputed_k
+                                  + recomputed_token_idx * recomputed_k_stride
+                                  + kv_head_idx * HEAD_SIZE;
+          k_vecs[j] = *reinterpret_cast<const K_vec*>(
+              k_ptr + vec_idx * VEC_SIZE);
         } else {
-          k_vecs[j] = *reinterpret_cast<const K_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+          const cache_t* k_ptr = k_cache
+                                 + physical_block_number * kv_block_stride
+                                 + kv_head_idx * kv_head_stride
+                                 + physical_block_offset * x;
+          const int offset1 = (vec_idx * VEC_SIZE) / x;
+          const int offset2 = (vec_idx * VEC_SIZE) % x;
+          if constexpr (IS_FP8_KV_CACHE) {
+#if defined(ENABLE_FP8_E5M2)
+            Quant_vec k_vec_quant = *reinterpret_cast<const Quant_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+            k_vecs[j] = fp8_e5m2_unscaled::vec_conversion<K_vec, Quant_vec>(k_vec_quant);
+#elif defined(ENABLE_FP8_E4M3)
+            Quant_vec k_vec_quant = *reinterpret_cast<const Quant_vec*>(k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+            k_vecs[j] = fp8_e4m3::scaled_vec_conversion<K_vec, Quant_vec>(k_vec_quant, kv_scale);
+#else
+            assert(false);
+#endif
+          } else {
+            k_vecs[j] = *reinterpret_cast<const K_vec*>(
+                k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+          }
         }
       }
 
@@ -337,18 +355,30 @@ __device__ void paged_attention_kernel(
     const int64_t physical_block_number = static_cast<int64_t>(block_table[block_idx]);
     const int physical_block_offset = (lane % NUM_V_VECS_PER_ROW) * V_VEC_SIZE;
     const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
+    const bool use_recomputed = token_idx < dropped_len;
     L_vec logits_vec;
     from_float(logits_vec, *reinterpret_cast<Float_L_vec*>(logits + token_idx - start_token_idx));
 
-    const cache_t* v_ptr = v_cache + physical_block_number * kv_block_stride
-                                   + kv_head_idx * kv_head_stride;
+    const cache_t* v_ptr = use_recomputed ? nullptr :
+        v_cache + physical_block_number * kv_block_stride
+                + kv_head_idx * kv_head_stride;
 #pragma unroll
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
       const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
       if (row_idx < HEAD_SIZE) {
         const int offset = row_idx * BLOCK_SIZE + physical_block_offset;
         V_vec v_vec;
-        if constexpr (IS_FP8_KV_CACHE) {
+        if (use_recomputed) {
+          scalar_t* v_vec_values = reinterpret_cast<scalar_t*>(&v_vec);
+#pragma unroll
+          for (int j = 0; j < V_VEC_SIZE; j++) {
+            const int recomputed_token_idx = recompute_start_locs[seq_idx]
+                                             + token_idx + j;
+            v_vec_values[j] = recomputed_v[
+                recomputed_token_idx * recomputed_v_stride
+                + kv_head_idx * HEAD_SIZE + row_idx];
+          }
+        } else if constexpr (IS_FP8_KV_CACHE) {
 #if defined(ENABLE_FP8_E5M2)
           V_quant_vec v_quant_vec = *reinterpret_cast<const V_quant_vec*>(v_ptr + offset);
           // Vector conversion from V_quant_vec to V_vec.
@@ -463,11 +493,20 @@ __global__ void paged_attention_v1_kernel(
   const int q_stride,
   const int kv_block_stride,
   const int kv_head_stride,
-  const float kv_scale) {
+  const float kv_scale,
+  const scalar_t* __restrict__ recomputed_k,
+  const scalar_t* __restrict__ recomputed_v,
+  const int* __restrict__ recompute_start_locs,
+  const int* __restrict__ dropped_lens,
+  const int recomputed_k_stride,
+  const int recomputed_v_stride) {
   paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, IS_FP8_KV_CACHE>(
     /* exp_sums */ nullptr, /* max_logits */ nullptr,
     out, q, k_cache, v_cache, num_kv_heads, scale, block_tables, seq_lens,
-    max_num_blocks_per_seq, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_scale);
+    max_num_blocks_per_seq, alibi_slopes, q_stride, kv_block_stride,
+    kv_head_stride, kv_scale, recomputed_k, recomputed_v,
+    recompute_start_locs, dropped_lens, recomputed_k_stride,
+    recomputed_v_stride);
 }
 
 // Grid: (num_heads, num_seqs, max_num_partitions).
@@ -499,7 +538,10 @@ __global__ void paged_attention_v2_kernel(
   paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS, IS_FP8_KV_CACHE, PARTITION_SIZE>(
     exp_sums, max_logits, tmp_out, q, k_cache, v_cache, num_kv_heads, scale,
     block_tables, seq_lens, max_num_blocks_per_seq, alibi_slopes,
-    q_stride, kv_block_stride, kv_head_stride, kv_scale);
+    q_stride, kv_block_stride, kv_head_stride, kv_scale,
+    /* recomputed_k */ nullptr, /* recomputed_v */ nullptr,
+    /* recompute_start_locs */ nullptr, /* dropped_lens */ nullptr,
+    /* recomputed_k_stride */ 0, /* recomputed_v_stride */ 0);
 }
 
 // Grid: (num_heads, num_seqs).
@@ -622,7 +664,13 @@ __global__ void paged_attention_v2_reduce_kernel(
     q_stride,                                                                                 \
     kv_block_stride,                                                                          \
     kv_head_stride,                                                                           \
-    kv_scale);
+    kv_scale,                                                                                 \
+    recomputed_k_ptr,                                                                         \
+    recomputed_v_ptr,                                                                         \
+    recompute_start_locs_ptr,                                                                 \
+    dropped_lens_ptr,                                                                         \
+    recomputed_k_stride,                                                                      \
+    recomputed_v_stride);
 
 // TODO(woosuk): Tune NUM_THREADS.
 template<
@@ -642,7 +690,11 @@ void paged_attention_v1_launcher(
   torch::Tensor& seq_lens,
   int max_seq_len,
   const c10::optional<torch::Tensor>& alibi_slopes,
-  float kv_scale) {
+  float kv_scale,
+  const c10::optional<torch::Tensor>& recomputed_k,
+  const c10::optional<torch::Tensor>& recomputed_v,
+  const c10::optional<torch::Tensor>& recompute_start_locs,
+  const c10::optional<torch::Tensor>& dropped_lens) {
   int num_seqs = query.size(0);
   int num_heads = query.size(1);
   int head_size = query.size(2);
@@ -665,6 +717,18 @@ void paged_attention_v1_launcher(
   CACHE_T* value_cache_ptr = reinterpret_cast<CACHE_T*>(value_cache.data_ptr());
   int* block_tables_ptr = block_tables.data_ptr<int>();
   int* seq_lens_ptr = seq_lens.data_ptr<int>();
+  T* recomputed_k_ptr = recomputed_k ?
+      reinterpret_cast<T*>(recomputed_k.value().data_ptr()) : nullptr;
+  T* recomputed_v_ptr = recomputed_v ?
+      reinterpret_cast<T*>(recomputed_v.value().data_ptr()) : nullptr;
+  int* recompute_start_locs_ptr = recompute_start_locs ?
+      recompute_start_locs.value().data_ptr<int>() : nullptr;
+  int* dropped_lens_ptr = dropped_lens ?
+      dropped_lens.value().data_ptr<int>() : nullptr;
+  int recomputed_k_stride = recomputed_k ?
+      recomputed_k.value().stride(0) : 0;
+  int recomputed_v_stride = recomputed_v ?
+      recomputed_v.value().stride(0) : 0;
 
   constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
   int padded_max_seq_len = DIVIDE_ROUND_UP(max_seq_len, BLOCK_SIZE) * BLOCK_SIZE;
@@ -718,7 +782,11 @@ void paged_attention_v1_launcher(
     seq_lens,                                                            \
     max_seq_len,                                                         \
     alibi_slopes,                                                            \
-    kv_scale);
+    kv_scale,                                                                 \
+    recomputed_k,                                                             \
+    recomputed_v,                                                             \
+    recompute_start_locs,                                                     \
+    dropped_lens);
 
 // NOTE(woosuk): To reduce the compilation time, we omitted block sizes
 // 1, 2, 4, 64, 128, 256.
@@ -752,6 +820,10 @@ void paged_attention_v1(
   const c10::optional<torch::Tensor>& alibi_slopes,
   const std::string& kv_cache_dtype,
   float kv_scale) {
+  const c10::optional<torch::Tensor> recomputed_k = c10::nullopt;
+  const c10::optional<torch::Tensor> recomputed_v = c10::nullopt;
+  const c10::optional<torch::Tensor> recompute_start_locs = c10::nullopt;
+  const c10::optional<torch::Tensor> dropped_lens = c10::nullopt;
   if (kv_cache_dtype == "auto") {
     if (query.dtype() == at::ScalarType::Float) {
       CALL_V1_LAUNCHER_BLOCK_SIZE(float, float, false);
@@ -774,6 +846,62 @@ void paged_attention_v1(
     }
   } else {
     TORCH_CHECK(false, "Unsupported data type of kv cache: ", kv_cache_dtype);
+  }
+}
+
+void paged_attention_v1_with_recomputed(
+  torch::Tensor& out,
+  torch::Tensor& query,
+  torch::Tensor& key_cache,
+  torch::Tensor& value_cache,
+  torch::Tensor& recomputed_k_tensor,
+  torch::Tensor& recomputed_v_tensor,
+  torch::Tensor& recompute_start_locs_tensor,
+  torch::Tensor& dropped_lens_tensor,
+  int num_kv_heads,
+  float scale,
+  torch::Tensor& block_tables,
+  torch::Tensor& seq_lens,
+  int block_size,
+  int max_seq_len,
+  const c10::optional<torch::Tensor>& alibi_slopes,
+  const std::string& kv_cache_dtype,
+  float kv_scale) {
+  TORCH_CHECK(kv_cache_dtype == "auto",
+              "eLLM recomputation currently requires auto KV cache dtype");
+  TORCH_CHECK(recomputed_k_tensor.dtype() == query.dtype() &&
+              recomputed_v_tensor.dtype() == query.dtype(),
+              "Recomputed K/V and query must have the same dtype");
+  TORCH_CHECK(recomputed_k_tensor.dim() == 3 &&
+              recomputed_v_tensor.dim() == 3,
+              "Recomputed K/V must have shape [tokens, kv_heads, head_size]");
+  TORCH_CHECK(recomputed_k_tensor.stride(2) == 1 &&
+              recomputed_v_tensor.stride(2) == 1 &&
+              recomputed_k_tensor.stride(1) == query.size(2) &&
+              recomputed_v_tensor.stride(1) == query.size(2),
+              "Recomputed K/V heads must be contiguous");
+  const int64_t element_size = query.element_size();
+  TORCH_CHECK(
+      reinterpret_cast<std::uintptr_t>(recomputed_k_tensor.data_ptr()) % 16
+          == 0 &&
+      recomputed_k_tensor.stride(0) * element_size % 16 == 0,
+      "Recomputed K rows must be 16-byte aligned");
+  TORCH_CHECK(dropped_lens_tensor.scalar_type() == at::ScalarType::Int &&
+              recompute_start_locs_tensor.scalar_type() == at::ScalarType::Int,
+              "eLLM prefix metadata must use int32 tensors");
+  const c10::optional<torch::Tensor> recomputed_k = recomputed_k_tensor;
+  const c10::optional<torch::Tensor> recomputed_v = recomputed_v_tensor;
+  const c10::optional<torch::Tensor> recompute_start_locs =
+      recompute_start_locs_tensor;
+  const c10::optional<torch::Tensor> dropped_lens = dropped_lens_tensor;
+  if (query.dtype() == at::ScalarType::Float) {
+    CALL_V1_LAUNCHER_BLOCK_SIZE(float, float, false);
+  } else if (query.dtype() == at::ScalarType::Half) {
+    CALL_V1_LAUNCHER_BLOCK_SIZE(uint16_t, uint16_t, false);
+  } else if (query.dtype() == at::ScalarType::BFloat16) {
+    CALL_V1_LAUNCHER_BLOCK_SIZE(__nv_bfloat16, __nv_bfloat16, false);
+  } else {
+    TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
   }
 }
 

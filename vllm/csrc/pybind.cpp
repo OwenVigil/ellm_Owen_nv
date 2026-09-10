@@ -13,6 +13,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     &paged_attention_v1,
     "Compute the attention between an input query and the cached keys/values using PagedAttention.");
   ops.def(
+    "paged_attention_v1_with_recomputed",
+    &paged_attention_v1_with_recomputed,
+    "PagedAttention over recomputed prefix K/V and resident paged K/V.");
+  ops.def(
     "paged_attention_v2",
     &paged_attention_v2,
     "PagedAttention V2.");

@@ -17,6 +17,25 @@ void paged_attention_v1(
   const std::string& kv_cache_dtype,
   float kv_scale);
 
+void paged_attention_v1_with_recomputed(
+  torch::Tensor& out,
+  torch::Tensor& query,
+  torch::Tensor& key_cache,
+  torch::Tensor& value_cache,
+  torch::Tensor& recomputed_k,
+  torch::Tensor& recomputed_v,
+  torch::Tensor& recompute_start_locs,
+  torch::Tensor& dropped_lens,
+  int num_kv_heads,
+  float scale,
+  torch::Tensor& block_tables,
+  torch::Tensor& seq_lens,
+  int block_size,
+  int max_seq_len,
+  const c10::optional<torch::Tensor>& alibi_slopes,
+  const std::string& kv_cache_dtype,
+  float kv_scale);
+
 void paged_attention_v2(
   torch::Tensor& out,
   torch::Tensor& exp_sums,

@@ -75,6 +75,9 @@ class PrepareDecodeMetadata(NamedTuple):
     lora_prompt_mapping: List[int]
     lora_requests: Set[LoRARequest]
     slot_mapping: List[int]
+    recompute_input_tokens: List[int]
+    recompute_input_positions: List[int]
+    recompute_seq_lens: List[int]
 
     @classmethod
     def empty(cls):
@@ -86,6 +89,9 @@ class PrepareDecodeMetadata(NamedTuple):
             lora_prompt_mapping=[],
             lora_requests=set(),
             slot_mapping=[],
+            recompute_input_tokens=[],
+            recompute_input_positions=[],
+            recompute_seq_lens=[],
         )
 
 
@@ -144,6 +150,12 @@ class ModelRunner:
 
         self.attn_backend = get_attn_backend(
             self.model_config.dtype if model_config is not None else None)
+        if (self.scheduler_config is not None
+                and self.scheduler_config.ellm_config.enabled
+                and self.attn_backend.__name__ != "XFormersBackend"):
+            raise RuntimeError(
+                "eLLM requires the XFormers backend. Set "
+                "VLLM_ATTENTION_BACKEND=XFORMERS.")
 
         # Lazy initialization
         self.model: torch.nn.Module  # Set after load_model
@@ -441,6 +453,9 @@ class ModelRunner:
         lora_index_mapping: List[int] = []
         lora_prompt_mapping: List[int] = []
         lora_requests: Set[LoRARequest] = set()
+        recompute_input_tokens: List[int] = []
+        recompute_input_positions: List[int] = []
+        recompute_seq_lens: List[int] = []
 
         # The following fields are only for flashinfer
         # Please follow https://docs.flashinfer.ai/tutorials/kv_layout.html#page-layout
@@ -487,7 +502,20 @@ class ModelRunner:
                 seq_lens.append(seq_len)
 
                 block_table = seq_group_metadata.block_tables[seq_id]
+                if self.scheduler_config.ellm_config.enabled:
+                    num_dropped_blocks = 0
+                    for cached_block in block_table:
+                        if cached_block != -1:
+                            break
+                        num_dropped_blocks += 1
+                    recompute_len = num_dropped_blocks * self.block_size
+                    recompute_input_tokens.extend(
+                        seq_data.get_token_ids()[:recompute_len])
+                    recompute_input_positions.extend(range(recompute_len))
+                    recompute_seq_lens.append(recompute_len)
                 block_number = block_table[position // self.block_size]
+                assert block_number >= 0, (
+                    "The block containing the decode token must stay resident")
                 block_offset = position % self.block_size
                 slot = block_number * self.block_size + block_offset
                 slot_mapping.append(slot)
@@ -609,6 +637,9 @@ class ModelRunner:
             lora_prompt_mapping=lora_prompt_mapping,
             lora_requests=lora_requests,
             slot_mapping=slot_mapping,
+            recompute_input_tokens=recompute_input_tokens,
+            recompute_input_positions=recompute_input_positions,
+            recompute_seq_lens=recompute_seq_lens,
         )
 
     def prepare_input_tensors(
@@ -646,6 +677,9 @@ class ModelRunner:
                 decode_lora_prompt_mapping,
                 decode_lora_requests,
                 decode_slot_mapping,
+                recompute_input_tokens,
+                recompute_input_positions,
+                recompute_seq_lens,
             ) = self._prepare_decode(decode_reqs)
             sampling_metadata = SamplingMetadata.prepare(
                 seq_group_metadata_list, seq_lens, query_lens, self.device,
@@ -676,6 +710,34 @@ class ModelRunner:
             slot_mapping = torch.tensor(slot_mapping,
                                         dtype=torch.long,
                                         device=self.device)
+            if recompute_input_tokens:
+                ellm_recompute_input_ids = torch.tensor(
+                    recompute_input_tokens,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                ellm_recompute_positions = torch.tensor(
+                    recompute_input_positions,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                recompute_lens_tensor = torch.tensor(
+                    recompute_seq_lens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                ellm_recompute_start_loc = torch.zeros(
+                    len(recompute_seq_lens) + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                torch.cumsum(recompute_lens_tensor,
+                             dim=0,
+                             out=ellm_recompute_start_loc[1:])
+            else:
+                ellm_recompute_input_ids = None
+                ellm_recompute_positions = None
+                ellm_recompute_start_loc = None
 
             if self.lora_config:
                 lora_mapping = LoRAMapping(
@@ -709,6 +771,10 @@ class ModelRunner:
                 "slot_mapping": slot_mapping,
                 "num_prefills": num_prefills,
                 "batch_type": batch_type,
+                "ellm_recompute_input_ids": ellm_recompute_input_ids,
+                "ellm_recompute_positions": ellm_recompute_positions,
+                "ellm_recompute_start_loc": ellm_recompute_start_loc,
+                "ellm_recompute_seq_lens": recompute_seq_lens,
             }
             if prefill_attn_metadata is not None:
                 metadata_dict.update(prefill_attn_metadata.asdict_zerocopy())
@@ -738,6 +804,14 @@ class ModelRunner:
             num_prefill_tokens = metadata_dict.pop("num_prefill_tokens")
             num_decode_tokens = metadata_dict.pop("num_decode_tokens")
             batch_type = metadata_dict.pop("batch_type")
+            ellm_recompute_input_ids = metadata_dict.pop(
+                "ellm_recompute_input_ids")
+            ellm_recompute_positions = metadata_dict.pop(
+                "ellm_recompute_positions")
+            ellm_recompute_start_loc = metadata_dict.pop(
+                "ellm_recompute_start_loc")
+            recompute_seq_lens = metadata_dict.pop(
+                "ellm_recompute_seq_lens")
 
             # Create an attention metadata.
             prefill_attn_metadata = None
@@ -770,6 +844,11 @@ class ModelRunner:
             prefill_metadata=prefill_attn_metadata,
             decode_metadata=decode_attn_metadata,
             kv_cache_dtype=self.kv_cache_dtype,
+            ellm_recompute_input_ids=ellm_recompute_input_ids,
+            ellm_recompute_positions=ellm_recompute_positions,
+            ellm_recompute_start_loc=ellm_recompute_start_loc,
+            ellm_recompute_seq_lens=recompute_seq_lens,
+            ellm_overlap_mode=self.scheduler_config.ellm_config.overlap_mode,
         )
 
         return (input_tokens, input_positions, attn_metadata,

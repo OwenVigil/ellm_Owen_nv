@@ -3,7 +3,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
-from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig,
+from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig, EllmConfig,
                          EngineConfig, LoadConfig, LoRAConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, SpeculativeConfig,
                          TokenizerPoolConfig, VisionLanguageConfig)
@@ -69,6 +69,11 @@ class EngineArgs:
     num_gpu_blocks_override: Optional[int] = None
     num_lookahead_slots: int = 0
     model_loader_extra_config: Optional[dict] = None
+
+    # Static eLLM recomputation experiment.
+    ellm_drop_ratio: float = 0.0
+    ellm_max_recompute_tokens: Optional[int] = None
+    ellm_overlap_mode: str = 'sequential'
 
     # Related to Vision-language models such as llava
     image_input_type: Optional[str] = None
@@ -290,6 +295,25 @@ class EngineArgs:
             default=None,
             help='If specified, ignore GPU profiling result and use this number'
             'of GPU blocks. Used for testing preemption.')
+        parser.add_argument(
+            '--ellm-drop-ratio',
+            type=float,
+            default=EngineArgs.ellm_drop_ratio,
+            help='Static fraction of oldest context tokens whose KV cache is '
+            'recomputed during decode. The effective value is rounded down '
+            'to complete KV blocks.')
+        parser.add_argument(
+            '--ellm-max-recompute-tokens',
+            type=int,
+            default=EngineArgs.ellm_max_recompute_tokens,
+            help='Maximum total number of prefix tokens recomputed in one '
+            'decode iteration. Defaults to max-num-batched-tokens.')
+        parser.add_argument(
+            '--ellm-overlap-mode',
+            choices=['sequential', 'streams'],
+            default=EngineArgs.ellm_overlap_mode,
+            help='Run prefix and decode attention sequentially or on separate '
+            'CUDA streams.')
         parser.add_argument('--max-num-batched-tokens',
                             type=int,
                             default=EngineArgs.max_num_batched_tokens,
@@ -554,6 +578,31 @@ class EngineArgs:
             ngram_prompt_lookup_min=self.ngram_prompt_lookup_min,
         )
 
+        ellm_config = EllmConfig(
+            drop_ratio=self.ellm_drop_ratio,
+            max_recompute_tokens=self.ellm_max_recompute_tokens,
+            overlap_mode=self.ellm_overlap_mode,
+        )
+        if ellm_config.enabled:
+            if not self.enforce_eager:
+                raise ValueError("eLLM currently requires --enforce-eager.")
+            if self.enable_prefix_caching:
+                raise ValueError("eLLM does not support prefix caching yet.")
+            if self.enable_lora:
+                raise ValueError("eLLM does not support LoRA yet.")
+            if speculative_config is not None:
+                raise ValueError("eLLM does not support speculative decoding.")
+            if model_config.get_sliding_window() is not None:
+                raise ValueError("eLLM does not support sliding-window models.")
+            if self.kv_cache_dtype != 'auto':
+                raise ValueError(
+                    "eLLM currently requires --kv-cache-dtype auto.")
+            architectures = getattr(model_config.hf_config, "architectures",
+                                    None) or []
+            if "LlamaForCausalLM" not in architectures:
+                raise ValueError("eLLM currently supports LlamaForCausalLM "
+                                 f"only. Got architectures={architectures}.")
+
         scheduler_config = SchedulerConfig(
             self.max_num_batched_tokens,
             self.max_num_seqs,
@@ -564,6 +613,7 @@ class EngineArgs:
                                  speculative_config.num_lookahead_slots),
             delay_factor=self.scheduler_delay_factor,
             enable_chunked_prefill=self.enable_chunked_prefill,
+            ellm_config=ellm_config,
         )
         lora_config = LoRAConfig(
             max_lora_rank=self.max_lora_rank,

@@ -92,6 +92,13 @@ class AttentionMetadata(Generic[T]):
     # The kv cache's data type.
     kv_cache_dtype: str
 
+    # Static eLLM recomputation inputs. These remain None on the normal path.
+    ellm_recompute_input_ids: Optional[torch.Tensor] = None
+    ellm_recompute_positions: Optional[torch.Tensor] = None
+    ellm_recompute_start_loc: Optional[torch.Tensor] = None
+    ellm_recompute_seq_lens: Optional[List[int]] = None
+    ellm_overlap_mode: str = "sequential"
+
     def __post_init__(self):
         if self.num_prefill_tokens > 0:
             assert self.num_prefills > 0

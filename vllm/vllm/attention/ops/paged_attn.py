@@ -159,6 +159,47 @@ class PagedAttention:
         return output
 
     @staticmethod
+    def forward_decode_with_recomputed(
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        recomputed_key: torch.Tensor,
+        recomputed_value: torch.Tensor,
+        recompute_start_locs: torch.Tensor,
+        dropped_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        kv_cache_dtype: str,
+        num_kv_heads: int,
+        scale: float,
+        alibi_slopes: Optional[torch.Tensor],
+        kv_scale: float,
+    ) -> torch.Tensor:
+        output = torch.empty_like(query)
+        block_size = value_cache.shape[3]
+        ops.paged_attention_v1_with_recomputed(
+            output,
+            query,
+            key_cache,
+            value_cache,
+            recomputed_key,
+            recomputed_value,
+            recompute_start_locs,
+            dropped_lens,
+            num_kv_heads,
+            scale,
+            block_tables,
+            seq_lens,
+            block_size,
+            max_seq_len,
+            alibi_slopes,
+            kv_cache_dtype,
+            kv_scale,
+        )
+        return output
+
+    @staticmethod
     def forward_prefix(
         query: torch.Tensor,
         key: torch.Tensor,

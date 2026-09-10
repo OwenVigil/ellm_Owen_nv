@@ -52,6 +52,32 @@ def paged_attention_v1(
                                 kv_cache_dtype, kv_scale)
 
 
+def paged_attention_v1_with_recomputed(
+    out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    recomputed_key: torch.Tensor,
+    recomputed_value: torch.Tensor,
+    recompute_start_locs: torch.Tensor,
+    dropped_lens: torch.Tensor,
+    num_kv_heads: int,
+    scale: float,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    max_seq_len: int,
+    alibi_slopes: Optional[torch.Tensor],
+    kv_cache_dtype: str,
+    kv_scale: float,
+) -> None:
+    vllm_ops.paged_attention_v1_with_recomputed(
+        out, query, key_cache, value_cache, recomputed_key,
+        recomputed_value, recompute_start_locs, dropped_lens, num_kv_heads,
+        scale, block_tables, seq_lens, block_size, max_seq_len, alibi_slopes,
+        kv_cache_dtype, kv_scale)
+
+
 def paged_attention_v2(
     out: torch.Tensor,
     exp_sum: torch.Tensor,

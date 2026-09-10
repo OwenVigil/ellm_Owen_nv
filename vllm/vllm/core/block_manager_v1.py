@@ -220,14 +220,19 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         watermark: float = 0.01,
         sliding_window: Optional[int] = None,
         enable_caching: bool = False,
+        ellm_drop_ratio: float = 0.0,
     ) -> None:
         self.block_size = block_size
         self.num_total_gpu_blocks = num_gpu_blocks
         self.num_total_cpu_blocks = num_cpu_blocks
+        self.ellm_drop_ratio = ellm_drop_ratio
 
         if enable_caching and sliding_window is not None:
             raise NotImplementedError(
                 "Sliding window is not allowed with prefix caching enabled!")
+        if ellm_drop_ratio and (enable_caching or sliding_window is not None):
+            raise ValueError("eLLM prefix recomputation is incompatible with "
+                             "prefix caching and sliding-window attention.")
 
         self.block_sliding_window = None
         if sliding_window is not None:
@@ -256,11 +261,33 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         # Mapping: seq_id -> BlockTable.
         self.block_tables: Dict[int, BlockTable] = {}
 
+    def get_num_recompute_tokens(self, seq: Sequence) -> int:
+        num_logical_blocks = len(seq.logical_token_blocks)
+        if not self.ellm_drop_ratio or num_logical_blocks <= 1:
+            return 0
+        target_blocks = int(seq.get_len() * self.ellm_drop_ratio)
+        target_blocks //= self.block_size
+        target_blocks = min(target_blocks, num_logical_blocks - 1)
+        return target_blocks * self.block_size
+
+    def evict_recompute_prefix(self, seq: Sequence) -> int:
+        num_dropped_blocks = (self.get_num_recompute_tokens(seq)
+                              // self.block_size)
+        block_table = self.block_tables[seq.seq_id]
+        for block_idx in range(num_dropped_blocks):
+            block = block_table[block_idx]
+            if block is not None:
+                self.gpu_allocator.free(block)
+                block_table[block_idx] = None
+        return num_dropped_blocks * self.block_size
+
     def can_allocate(self, seq_group: SequenceGroup) -> AllocStatus:
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
         seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
-        num_required_blocks = len(seq.logical_token_blocks)
+        num_required_blocks = (len(seq.logical_token_blocks) -
+                               self.get_num_recompute_tokens(seq) //
+                               self.block_size)
 
         if self.block_sliding_window is not None:
             num_required_blocks = min(num_required_blocks,
@@ -285,8 +312,12 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         num_prompt_blocks = len(seq.logical_token_blocks)
 
         block_table: BlockTable = []
+        num_dropped_blocks = (self.get_num_recompute_tokens(seq)
+                              // self.block_size)
         for logical_idx in range(num_prompt_blocks):
-            if (self.block_sliding_window is not None
+            if logical_idx < num_dropped_blocks:
+                block = None
+            elif (self.block_sliding_window is not None
                     and logical_idx >= self.block_sliding_window):
                 block = block_table[logical_idx % self.block_sliding_window]
                 # Set the reference counts of the token blocks.
@@ -439,6 +470,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         # is only incremented by one, so we deduplicate them by wrapping
         # them in a set.
         for block in set(src_block_table):
+            if block is None:
+                continue
             block.ref_count += 1
 
     def _get_physical_blocks(
@@ -449,7 +482,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         for seq in seq_group.get_seqs():
             if seq.is_finished():
                 continue
-            blocks.update(self.block_tables[seq.seq_id])
+            blocks.update(block for block in self.block_tables[seq.seq_id]
+                          if block is not None)
         return list(blocks)
 
     def can_swap_in(self,
@@ -484,6 +518,9 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             block_table = self.block_tables[seq.seq_id]
 
             for cpu_block in block_table:
+                if cpu_block is None:
+                    new_block_table.append(None)
+                    continue
                 if cpu_block in mapping:
                     gpu_block = mapping[cpu_block]
                     gpu_block.ref_count += 1
@@ -514,6 +551,9 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             block_table = self.block_tables[seq.seq_id]
 
             for gpu_block in block_table:
+                if gpu_block is None:
+                    new_block_table.append(None)
+                    continue
                 if gpu_block in mapping:
                     cpu_block = mapping[gpu_block]
                     cpu_block.ref_count += 1
@@ -542,6 +582,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
                           if self.block_sliding_window is not None else
                           block_table)
         for block in set(blocks_to_free):
+            if block is None:
+                continue
             if block.device == Device.GPU:
                 self.gpu_allocator.free(block)
             else:
@@ -562,7 +604,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
 
     def get_block_table(self, seq: Sequence) -> List[int]:
         block_table = self.block_tables[seq.seq_id]
-        return [block.block_number for block in block_table]
+        return [(-1 if block is None else block.block_number)
+                for block in block_table]
 
     def get_num_free_gpu_blocks(self) -> int:
         return self.gpu_allocator.get_num_free_blocks()
@@ -580,6 +623,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             # in this step.
             block_table = self.block_tables[seq.seq_id]
             for block in block_table:
+                if block is None:
+                    continue
                 block.last_accessed = access_time
 
     def compute_full_blocks_in_seq(self, seq: Sequence):
@@ -590,6 +635,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         if max_full_block == -1:
             return
         for i in reversed(range(max_full_block)):
+            if block_table[i] is None:
+                continue
             if block_table[i].computed:
                 break
             block_table[i].computed = True

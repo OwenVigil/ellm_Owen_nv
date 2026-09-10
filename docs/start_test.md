@@ -21,7 +21,8 @@ python -m vllm.entrypoints.openai.api_server \
   --max-model-len 2048 \
   --gpu-memory-utilization 0.90 \
   --swap-space 16 \
-  --max-num-seqs 128 \
+  --max-num-seqs 512 \
+  --max-num-batched-tokens 8192 \
   --disable-log-requests \
   2>&1 | tee logs/vllm_server.log
 (
@@ -33,7 +34,31 @@ python -m vllm.entrypoints.openai.api_server \
   mkdir -p /workspace/ellm_workspace/ray_tmp
   export RAY_TMPDIR=/workspace/ellm_workspace/ray_tmp
 )
-等看到服务启动后，另开一个终端检查：
+
+
+ellm版本测试：
+```bash
+python -m vllm.entrypoints.openai.api_server \
+  --host localhost \
+  --port 8000 \
+  --model ../model/Llama-2-13b-hf \
+  --tokenizer ../model/Llama-2-13b-hf \
+  --served-model-name llama2-13b \
+  --tensor-parallel-size 4 \
+  --dtype float16 \
+  --max-model-len 2048 \
+  --gpu-memory-utilization 0.90 \
+  --swap-space 16 \
+  --max-num-seqs 512 \
+  --max-num-batched-tokens 8192 \
+  --enforce-eager \
+  --disable-log-requests \
+  --ellm-drop-ratio 0.01 \
+  --ellm-max-recompute-tokens 8192 \
+  --ellm-overlap-mode streams
+```
+
+等看到服务启动后，另开一个终端检查:
 
 cd /workspace/ellm_workspace/vllm
 source ../.venv/bin/activate
@@ -52,7 +77,7 @@ python benchmarks/benchmark_serving.py \
   --tokenizer ../model/Llama-2-13b-hf \
   --dataset-name sharegpt \
   --dataset-path ../dataset/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json \
-  --num-prompts 100 \
+  --num-prompts 800 \
   --sharegpt-output-len 512 \
   --request-rate 2 \
   --save-result \
@@ -61,6 +86,7 @@ python benchmarks/benchmark_serving.py \
   --metadata tp=4 max_model_len=2048
 
 先用 32 条确认能跑通；之后再改 --num-prompts 256/1000，或把 --request-rate 调成 0.5 1 2 4 inf 观察压力变化。
+
 
 3. 可视化 benchmark 结果
 

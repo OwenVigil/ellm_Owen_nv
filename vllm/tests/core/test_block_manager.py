@@ -89,6 +89,52 @@ def test_allocate():
     assert block_manager.can_allocate(seq_group) != AllocStatus.OK
 
 
+def test_ellm_drops_complete_prefix_blocks():
+    block_size = 4
+    block_manager = BlockSpaceManagerV1(
+        block_size=block_size,
+        num_cpu_blocks=0,
+        num_gpu_blocks=10,
+        watermark=0,
+        ellm_drop_ratio=0.5,
+    )
+    prompt, seq_group = create_dummy_prompt(
+        "1", prompt_length=20, block_size=block_size)
+
+    assert block_manager.get_num_recompute_tokens(prompt) == 8
+    block_manager.allocate(seq_group)
+    assert block_manager.get_num_free_gpu_blocks() == 7
+    block_table = block_manager.get_block_table(prompt)
+    assert block_table[:2] == [-1, -1]
+    assert all(block >= 0 for block in block_table[2:])
+
+
+def test_ellm_evicts_newly_eligible_blocks_as_sequence_grows():
+    block_size = 4
+    block_manager = BlockSpaceManagerV1(
+        block_size=block_size,
+        num_cpu_blocks=0,
+        num_gpu_blocks=10,
+        watermark=0,
+        ellm_drop_ratio=0.5,
+    )
+    prompt, seq_group = create_dummy_prompt(
+        "1", prompt_length=20, block_size=block_size)
+    block_manager.allocate(seq_group)
+
+    for token_id in range(20, 24):
+        prompt.append_token_id(token_id, {token_id: Logprob(0.0)})
+
+    assert block_manager.get_num_recompute_tokens(prompt) == 12
+    free_blocks = block_manager.get_num_free_gpu_blocks()
+    assert block_manager.evict_recompute_prefix(prompt) == 12
+    assert block_manager.get_num_free_gpu_blocks() == free_blocks + 1
+    assert block_manager.get_block_table(prompt)[:3] == [-1, -1, -1]
+
+    block_manager.append_slots(prompt)
+    assert block_manager.get_block_table(prompt)[-1] >= 0
+
+
 def test_append_slot_single_seq():
     block_size = 4
     num_cpu_blocks = 4

@@ -581,6 +581,39 @@ class ParallelConfig:
                              "run with Ray.")
 
 
+@dataclass
+class EllmConfig:
+    """Static configuration for the eLLM recomputation experiment."""
+
+    drop_ratio: float = 0.0
+    max_recompute_tokens: Optional[int] = None
+    overlap_mode: str = "sequential"
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.drop_ratio < 1.0:
+            raise ValueError("eLLM drop ratio must be in [0, 1). Got "
+                             f"{self.drop_ratio}.")
+        if (self.max_recompute_tokens is not None
+                and self.max_recompute_tokens <= 0):
+            raise ValueError("eLLM max recompute tokens must be positive. Got "
+                             f"{self.max_recompute_tokens}.")
+        if self.overlap_mode not in ("sequential", "streams"):
+            raise ValueError("eLLM overlap mode must be 'sequential' or "
+                             f"'streams'. Got {self.overlap_mode!r}.")
+
+    @property
+    def enabled(self) -> bool:
+        return self.drop_ratio > 0.0
+
+    def metrics_info(self) -> dict:
+        return {
+            "enabled": str(self.enabled),
+            "drop_ratio": str(self.drop_ratio),
+            "max_recompute_tokens": str(self.max_recompute_tokens),
+            "overlap_mode": self.overlap_mode,
+        }
+
+
 class SchedulerConfig:
     """Scheduler configuration.
 
@@ -611,6 +644,7 @@ class SchedulerConfig:
         num_lookahead_slots: int = 0,
         delay_factor: float = 0.0,
         enable_chunked_prefill: bool = False,
+        ellm_config: Optional[EllmConfig] = None,
     ) -> None:
         if max_num_batched_tokens is not None:
             self.max_num_batched_tokens = max_num_batched_tokens
@@ -632,6 +666,9 @@ class SchedulerConfig:
         self.num_lookahead_slots = num_lookahead_slots
         self.delay_factor = delay_factor
         self.chunked_prefill_enabled = enable_chunked_prefill
+        self.ellm_config = ellm_config or EllmConfig()
+        if self.ellm_config.max_recompute_tokens is None:
+            self.ellm_config.max_recompute_tokens = self.max_num_batched_tokens
 
         self._verify_args()
 
@@ -657,6 +694,12 @@ class SchedulerConfig:
                 "num_lookahead_slots "
                 f"({self.num_lookahead_slots}) must be greater than or "
                 "equal to 0.")
+
+        if self.ellm_config.enabled:
+            if self.use_v2_block_manager:
+                raise ValueError("eLLM currently requires block manager V1.")
+            if self.chunked_prefill_enabled:
+                raise ValueError("eLLM does not support chunked prefill yet.")
 
 
 class DeviceConfig:

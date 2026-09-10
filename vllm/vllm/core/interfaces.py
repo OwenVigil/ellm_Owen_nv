@@ -44,6 +44,14 @@ class BlockSpaceManager(ABC):
     def allocate(self, seq_group: SequenceGroup) -> None:
         pass
 
+    def get_num_recompute_tokens(self, seq: Sequence) -> int:
+        """Return the block-aligned prefix length materialized by eLLM."""
+        return 0
+
+    def evict_recompute_prefix(self, seq: Sequence) -> int:
+        """Release newly eligible eLLM prefix blocks and return token count."""
+        return 0
+
     @abstractmethod
     def can_append_slots(self, seq_group: SequenceGroup,
                          num_lookahead_slots: int) -> bool:

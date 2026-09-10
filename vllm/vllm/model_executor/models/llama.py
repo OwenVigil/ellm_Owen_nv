@@ -281,7 +281,19 @@ class LlamaModel(nn.Module):
         attn_metadata: AttentionMetadata,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if inputs_embeds is not None:
+        num_recompute_tokens = 0
+        if attn_metadata.ellm_recompute_input_ids is not None:
+            if inputs_embeds is not None:
+                raise ValueError("eLLM does not support inputs_embeds.")
+            recompute_hidden_states = self.get_input_embeddings(
+                attn_metadata.ellm_recompute_input_ids)
+            decode_hidden_states = self.get_input_embeddings(input_ids)
+            num_recompute_tokens = recompute_hidden_states.shape[0]
+            hidden_states = torch.cat(
+                (recompute_hidden_states, decode_hidden_states), dim=0)
+            positions = torch.cat(
+                (attn_metadata.ellm_recompute_positions, positions), dim=0)
+        elif inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.get_input_embeddings(input_ids)
@@ -296,6 +308,8 @@ class LlamaModel(nn.Module):
                 residual,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        if num_recompute_tokens:
+            hidden_states = hidden_states[num_recompute_tokens:]
         return hidden_states
 
 

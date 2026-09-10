@@ -189,6 +189,10 @@ class XFormersImpl(AttentionImpl):
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
 
+        if attn_metadata.ellm_recompute_input_ids is not None:
+            return self._forward_ellm(query, key, value, kv_cache,
+                                      attn_metadata, kv_scale)
+
         if kv_cache is not None:
             key_cache, value_cache = PagedAttention.split_kv_cache(
                 kv_cache, self.num_kv_heads, self.head_size)
@@ -268,12 +272,105 @@ class XFormersImpl(AttentionImpl):
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
 
+    def _forward_ellm(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata[XFormersMetadata],
+        kv_scale: float,
+    ) -> torch.Tensor:
+        assert kv_cache is not None
+        assert attn_metadata.decode_metadata is not None
+        assert attn_metadata.ellm_recompute_start_loc is not None
+        assert attn_metadata.ellm_recompute_seq_lens is not None
+
+        num_recompute_tokens = (
+            attn_metadata.ellm_recompute_input_ids.shape[0])
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        assert query.shape[0] == num_recompute_tokens + num_decode_tokens
+
+        key_cache, value_cache = PagedAttention.split_kv_cache(
+            kv_cache, self.num_kv_heads, self.head_size)
+        recompute_slots = torch.full(
+            (num_recompute_tokens, ),
+            -1,
+            dtype=attn_metadata.slot_mapping.dtype,
+            device=attn_metadata.slot_mapping.device,
+        )
+        slot_mapping = torch.cat(
+            (recompute_slots, attn_metadata.slot_mapping), dim=0)
+        PagedAttention.write_to_paged_cache(key, value, key_cache,
+                                            value_cache, slot_mapping,
+                                            attn_metadata.kv_cache_dtype,
+                                            kv_scale)
+
+        output = torch.empty_like(query)
+        recompute_query = query[:num_recompute_tokens]
+        recomputed_key = key[:num_recompute_tokens]
+        recomputed_value = value[:num_recompute_tokens]
+        decode_query = query[num_recompute_tokens:]
+        decode_meta = attn_metadata.decode_metadata
+        dropped_lens = (attn_metadata.ellm_recompute_start_loc[1:] -
+                        attn_metadata.ellm_recompute_start_loc[:-1])
+        prefix_seq_lens = [
+            seq_len for seq_len in attn_metadata.ellm_recompute_seq_lens
+            if seq_len > 0
+        ]
+
+        def run_recompute_attention() -> None:
+            recompute_output = self._run_memory_efficient_xformers_forward(
+                recompute_query,
+                recomputed_key,
+                recomputed_value,
+                decode_meta,
+                seq_lens=prefix_seq_lens,
+            )
+            output[:num_recompute_tokens].copy_(recompute_output)
+
+        def run_decode_attention() -> None:
+            decode_output = PagedAttention.forward_decode_with_recomputed(
+                decode_query,
+                key_cache,
+                value_cache,
+                recomputed_key,
+                recomputed_value,
+                attn_metadata.ellm_recompute_start_loc,
+                dropped_lens,
+                decode_meta.block_tables,
+                decode_meta.seq_lens_tensor,
+                decode_meta.max_seq_len,
+                attn_metadata.kv_cache_dtype,
+                self.num_kv_heads,
+                self.scale,
+                self.alibi_slopes,
+                kv_scale,
+            )
+            output[num_recompute_tokens:].copy_(decode_output)
+
+        if attn_metadata.ellm_overlap_mode == "streams":
+            if not hasattr(self, "_ellm_recompute_stream"):
+                self._ellm_recompute_stream = torch.cuda.Stream()
+            current_stream = torch.cuda.current_stream()
+            self._ellm_recompute_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self._ellm_recompute_stream):
+                run_recompute_attention()
+            run_decode_attention()
+            current_stream.wait_stream(self._ellm_recompute_stream)
+        else:
+            run_recompute_attention()
+            run_decode_attention()
+
+        return output.view(-1, self.num_heads * self.head_size)
+
     def _run_memory_efficient_xformers_forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: XFormersMetadata,
+        seq_lens: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """Attention for 1D query of multiple prompts. Multiple prompt
         tokens are flattened in to `query` input.
@@ -288,7 +385,8 @@ class XFormersImpl(AttentionImpl):
             value: shape = [num_prefill_tokens, num_kv_heads, head_size]
             attn_metadata: Metadata for attention.
         """
-        assert attn_metadata.seq_lens is not None
+        seq_lens = attn_metadata.seq_lens if seq_lens is None else seq_lens
+        assert seq_lens is not None
         original_query = query
         if self.num_kv_heads != self.num_heads:
             # GQA/MQA requires the shape [B, M, G, H, K].
@@ -308,8 +406,7 @@ class XFormersImpl(AttentionImpl):
         # FIXME(woosuk): This is a hack.
         if attn_metadata.attn_bias is None:
             if self.alibi_slopes is None:
-                attn_bias = BlockDiagonalCausalMask.from_seqlens(
-                    attn_metadata.seq_lens)
+                attn_bias = BlockDiagonalCausalMask.from_seqlens(seq_lens)
                 if self.sliding_window is not None:
                     attn_bias = attn_bias.make_local_attention(
                         self.sliding_window)
@@ -317,7 +414,7 @@ class XFormersImpl(AttentionImpl):
             else:
                 attn_metadata.attn_bias = _make_alibi_bias(
                     self.alibi_slopes, self.num_kv_heads, query.dtype,
-                    attn_metadata.seq_lens)
+                    seq_lens)
 
         # No alibi slopes.
         # TODO(woosuk): Too many view operations. Let's try to reduce
@@ -342,7 +439,7 @@ class XFormersImpl(AttentionImpl):
         # one. This is inefficient, especially when we have many short prompts.
         output = torch.empty_like(original_query)
         start = 0
-        for i, seq_len in enumerate(attn_metadata.seq_lens):
+        for i, seq_len in enumerate(seq_lens):
             end = start + seq_len
             out = xops.memory_efficient_attention_forward(
                 query[None, start:end],

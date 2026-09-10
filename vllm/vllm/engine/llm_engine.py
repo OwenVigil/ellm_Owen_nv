@@ -223,6 +223,8 @@ class LLMEngine:
                 labels=dict(model_name=model_config.served_model_name),
                 max_model_len=self.model_config.max_model_len)
             self.stat_logger.info("cache_config", self.cache_config)
+            self.stat_logger.info("ellm_config",
+                                  self.scheduler_config.ellm_config)
 
         # Create sequence output processor, e.g. for beam search or
         # speculative decoding.
@@ -650,6 +652,7 @@ class LLMEngine:
         # Iteration stats
         num_prompt_tokens_iter = 0
         num_generation_tokens_iter = 0
+        num_ellm_recompute_tokens_iter = 0
         time_to_first_tokens_iter: List[float] = []
         time_per_output_tokens_iter: List[float] = []
 
@@ -666,6 +669,8 @@ class LLMEngine:
         # NOTE: This loop assumes prefill seq_groups are before
         # decode seq_groups in scheduled_seq_groups.
         if scheduler_outputs is not None:
+            num_ellm_recompute_tokens_iter = (
+                scheduler_outputs.num_ellm_recompute_tokens)
             num_generation_tokens_from_prefill_groups = 0.
             # NOTE: if scheduler_outputs.num_prefill_groups > 0 and
             # the len of scheduler_outputs.scheduled_seq_groups is !=
@@ -756,6 +761,8 @@ class LLMEngine:
             # Iteration stats
             num_prompt_tokens_iter=num_prompt_tokens_iter,
             num_generation_tokens_iter=num_generation_tokens_iter,
+            num_ellm_recompute_tokens_iter=(
+                num_ellm_recompute_tokens_iter),
             time_to_first_tokens_iter=time_to_first_tokens_iter,
             time_per_output_tokens_iter=time_per_output_tokens_iter,
             spec_decode_metrics=spec_decode_metrics,
